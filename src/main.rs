@@ -6,14 +6,16 @@ extern crate vulkano_win;
 
 use std::cmp::{min, max};
 use std::vec::Vec;
+use std::time::Instant;
 use std::sync::Arc;
 use vulkano::instance::{PhysicalDevice, Instance};
 use vulkano_win::VkSurfaceBuild;
 use winit::{Event, WindowEvent, WindowBuilder, EventsLoop, Window};
 use vulkano::device::{Device, DeviceExtensions};
 use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreationError, PresentMode};
+use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::image::swapchain::SwapchainImage;
-use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
+use vulkano::buffer::{CpuBufferPool, BufferUsage, CpuAccessibleBuffer};
 use vulkano::pipeline::{viewport::Viewport, GraphicsPipeline};
 use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass};
 use vulkano::format::ClearValue;
@@ -40,7 +42,10 @@ fn main() {
     let physical_device = PhysicalDevice::enumerate(&instance).next().expect("No devices");
 
     let mut events_loop = EventsLoop::new();
-    let surface = WindowBuilder::new().build_vk_surface(&events_loop, instance.clone())
+    let surface = WindowBuilder::new()
+        .with_title("Riley's Vulkan Render Engine")
+        .with_decorations(true)
+        .build_vk_surface(&events_loop, instance.clone())
         .expect("Could not create window");
     let window = surface.window();
 
@@ -105,6 +110,9 @@ fn main() {
         Vertex { position: [0.25, -0.1] },
     ].iter().cloned()).expect("Could not create vertex buffer");
 
+    //Ring buffer than contains sub-buffers which are freed upon being dropped (cleanup_finished())
+    let fragment_color_buffer = CpuBufferPool::<frag::ty::ColorData>::new(device.clone(), BufferUsage::all());
+
     let vs = vertex::Shader::load(device.clone()).expect("Could not load vertex shader");
     let fs =   frag::Shader::load(device.clone()).expect("Could not load fragment shader");
 
@@ -144,6 +152,8 @@ fn main() {
 
     let mut done = false;
 
+    let start = Instant::now();
+
     loop {
         previous_frame_end.cleanup_finished();
         if recreate_swapchain {
@@ -171,9 +181,21 @@ fn main() {
 
         let clear_values: Vec<ClearValue> = vec!([0.0, 0.3, 0.6, 1.0].into());
 
+        let fragment_color_subbuffer = {
+            let elapsed = (start.elapsed().as_millis() % 1000) as f32 / 1000.0;           
+            let data = frag::ty::ColorData {
+                color_data: [elapsed, 0.5, 0.5].into()
+            };  
+            fragment_color_buffer.next(data).expect("Could not generate next triangle color")
+        }; 
+
+        let set = Arc::new(PersistentDescriptorSet::start(pipeline.clone(), 0)
+            .add_buffer(fragment_color_subbuffer).expect("Could not add fragment subbuffer to descriptor set")
+            .build().unwrap());
+
         let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
             .begin_render_pass(framebuffers[image_num].clone(), false, clear_values).unwrap()
-            .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), (), ()).unwrap()
+            .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), set, ()).unwrap()
             .end_render_pass().unwrap()
             .build().unwrap();
         
