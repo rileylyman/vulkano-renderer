@@ -3,15 +3,19 @@ extern crate vulkano;
 extern crate vulkano_shaders;
 extern crate winit;
 extern crate vulkano_win;
+extern crate image;
 
 use std::cmp::{min, max};
 use std::vec::Vec;
 use std::time::Instant;
 use std::sync::Arc;
 use std::error::Error;
-use vulkano::instance::{PhysicalDevice, Instance};
-use vulkano_win::VkSurfaceBuild;
 use winit::{Event, WindowEvent, WindowBuilder, EventsLoop, Window};
+use image::ImageFormat;
+use vulkano::instance::{PhysicalDevice, Instance};
+use vulkano::sampler::{Sampler, Filter, MipmapMode, SamplerAddressMode};
+use vulkano::image::{ImageCreationError, immutable::ImmutableImage, Dimensions};
+use vulkano_win::VkSurfaceBuild;
 use vulkano::device::{Device, DeviceExtensions, Queue, QueuesIter};
 use vulkano::swapchain::{AcquireError, Surface, Swapchain, SwapchainCreationError, PresentMode};
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
@@ -19,10 +23,10 @@ use vulkano::image::swapchain::SwapchainImage;
 use vulkano::buffer::{CpuBufferPool, BufferUsage, CpuAccessibleBuffer};
 use vulkano::pipeline::{viewport::Viewport, GraphicsPipeline};
 use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass};
-use vulkano::format::ClearValue;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, DynamicState};
+use vulkano::format::{Format, ClearValue};
+use vulkano::command_buffer::{CommandBufferExecFuture, AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
 use vulkano::sync;
-use vulkano::sync::{FlushError, GpuFuture};
+use vulkano::sync::{NowFuture, FlushError, GpuFuture};
 
 #[derive(Clone, Debug)]
 struct Vertex {
@@ -77,6 +81,16 @@ fn main() {
         .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
         .build(device.clone())
         .expect("Could not create GraphicsPipeline"));
+
+    let (texture, texture_future) = load_texture(queue.clone(), include_bytes!("res/texture.png"))
+        .expect("Error loading texture");
+    let sampler = Sampler::new(device.clone(), Filter::Linear, Filter::Linear,
+        MipmapMode::Nearest, SamplerAddressMode::Repeat, SamplerAddressMode::Repeat,
+        SamplerAddressMode::Repeat, 0.0, 1.0, 0.0, 0.0).expect("Could not create sampler");
+    let texture_set = Arc::new(PersistentDescriptorSet::start(pipeline.clone(), 1)
+        .add_sampled_image(texture.clone(), sampler.clone())
+        .expect("Could not add sampled image")
+        .build().unwrap());
     
     let mut dynamic_state = DynamicState { line_width: None, viewports: None, scissors: None };
 
@@ -84,7 +98,7 @@ fn main() {
 
     let mut recreate_swapchain = false;
 
-    let mut previous_frame_end = Box::new(sync::now(device.clone())) as Box<GpuFuture>;
+    let mut previous_frame_end = Box::new(texture_future) as Box<GpuFuture>;
 
     let mut done = false;
 
@@ -131,7 +145,8 @@ fn main() {
 
         let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
             .begin_render_pass(framebuffers[image_num].clone(), false, clear_values).unwrap()
-            .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), set, ()).unwrap()
+            .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), 
+                  (set.clone(), texture_set.clone()), ()).unwrap()
             .end_render_pass().unwrap()
             .build().unwrap();
         
@@ -204,46 +219,53 @@ fn init_vulkan() -> Result<(Arc<Device>, QueuesIter, Arc<Surface<Window>>, Event
 fn gen_swapchain(surface: Arc<Surface<Window>>, queue: Arc<Queue>, device: Arc<Device>) 
     -> Result<(Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>), SwapchainCreationError> {
         
-        let window = surface.window();
+    let window = surface.window();
 
-        let capabilities = surface.capabilities(device.physical_device()).unwrap();
+    let capabilities = surface.capabilities(device.physical_device()).unwrap();
 
-        let usage = capabilities.supported_usage_flags;
+    let usage = capabilities.supported_usage_flags;
 
-        let alpha = capabilities.supported_composite_alpha.iter().next().unwrap();
-        
-        //TODO: Choose format based on our needs.
-        let format = capabilities.supported_formats[0].0;
-        
-        //TODO: Use more layers if necessary.
-        let layers = 1;
+    let alpha = capabilities.supported_composite_alpha.iter().next().unwrap();
+    
+    //TODO: Choose format based on our needs.
+    let format = capabilities.supported_formats[0].0;
+    
+    //TODO: Use more layers if necessary.
+    let layers = 1;
 
-        //NOTE: We could set this to capabilities.current_extent.unwrap_or(DEFAULT..)
-        //But since either way we want the initial dimensions to be the window dimensions
-        //we just get the physical dimensions this way
-        let dimensions = if let Some(dimensions) = window.get_inner_size() {
-            let dims: (u32, u32) = dimensions.to_physical(window.get_hidpi_factor()).into();
-            [dims.0, dims.1]
-        } else {
-            return Err(SwapchainCreationError::SurfaceLost);
-        };
+    let dimensions = get_window_dimensions(&window)?;
 
-        let transform = capabilities.current_transform;
+    let transform = capabilities.current_transform;
 
-        //Attempt to use triple buffering
-        let buffer_count = if let Some(limit) = capabilities.max_image_count {
-            min(3, limit)
-        } else { 
-            max(3, capabilities.min_image_count) 
-        };
+    //Attempt to use triple buffering
+    let buffer_count = if let Some(limit) = capabilities.max_image_count {
+        min(3, limit)
+    } else { 
+        max(3, capabilities.min_image_count) 
+    };
 
-        let clip = true; //Clip parts of the buffer which aren't visible
+    let clip = true; //Clip parts of the buffer which aren't visible
 
-        let present_mode = PresentMode::Fifo;
+    let present_mode = PresentMode::Fifo;
 
-        Swapchain::new(device.clone(), surface.clone(), buffer_count, format, dimensions,
-            layers, usage, &queue, transform, alpha, present_mode, clip, None)
+    Swapchain::new(device.clone(), surface.clone(), buffer_count, format, dimensions,
+        layers, usage, &queue, transform, alpha, present_mode, clip, None)
 }
+
+fn load_texture(queue: Arc<Queue>, bytes: &[u8]) ->  
+    Result<(Arc<ImmutableImage<Format>>, CommandBufferExecFuture<NowFuture, AutoCommandBuffer>), ImageCreationError> {
+
+    let image = image::load_from_memory_with_format(bytes,
+        ImageFormat::PNG).expect("Could not load image").to_rgba(); 
+    let w = image.width();
+    let h = image.height();
+    let image_data = image.into_raw().clone();
+
+    ImmutableImage::from_iter(image_data.iter().cloned(),
+        Dimensions::Dim2d { width: w, height: h },
+        Format::R8G8B8A8Srgb,
+        queue.clone())
+} 
 
 fn gen_framebuffers_from_window_size(
     images: &[Arc<SwapchainImage<Window>>],
@@ -269,12 +291,16 @@ fn gen_framebuffers_from_window_size(
     }).collect::<Vec<_>>()
 }
 
-fn get_window_dimensions(window: &Window) -> Result<[u32;2], ()> {
+fn get_window_dimensions(window: &Window) -> Result<[u32;2], SwapchainCreationError> {
+    
+    //NOTE: We could set this to capabilities.current_extent.unwrap_or(DEFAULT..)
+    //But since either way we want the initial dimensions to be the window dimensions
+    //we just get the physical dimensions this way
     if let Some(dimensions) = window.get_inner_size() {
         let dimensions: (u32, u32) = dimensions.to_physical(window.get_hidpi_factor()).into();
         Ok([dimensions.0, dimensions.1])
     } else {
-       Err(()) 
+       Err(SwapchainCreationError::SurfaceLost) 
     }  
 }  
 
