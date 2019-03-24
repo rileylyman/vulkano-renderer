@@ -8,11 +8,12 @@ use std::cmp::{min, max};
 use std::vec::Vec;
 use std::time::Instant;
 use std::sync::Arc;
+use std::error::Error;
 use vulkano::instance::{PhysicalDevice, Instance};
 use vulkano_win::VkSurfaceBuild;
 use winit::{Event, WindowEvent, WindowBuilder, EventsLoop, Window};
-use vulkano::device::{Device, DeviceExtensions};
-use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreationError, PresentMode};
+use vulkano::device::{Device, DeviceExtensions, Queue, QueuesIter};
+use vulkano::swapchain::{AcquireError, Surface, Swapchain, SwapchainCreationError, PresentMode};
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::image::swapchain::SwapchainImage;
 use vulkano::buffer::{CpuBufferPool, BufferUsage, CpuAccessibleBuffer};
@@ -29,80 +30,15 @@ struct Vertex {
 } vulkano::impl_vertex!(Vertex, position);
 
 fn main() {
-    let instance = {
-        let extensions = vulkano_win::required_extensions();
-        let info = app_info_from_cargo_toml!();
-        Instance::new(Some(&info), &extensions, None).expect("Could not create instance")
-    };
 
-    //TODO: Filter devices by
-    //  1.) Optional features needed by my application
-    //  2.) Devices that can draw to my surface
-    //  3.) Let user choose between the rest (or just choose first one after that)
-    let physical_device = PhysicalDevice::enumerate(&instance).next().expect("No devices");
-
-    let mut events_loop = EventsLoop::new();
-    let surface = WindowBuilder::new()
-        .with_title("Riley's Vulkan Render Engine")
-        .with_decorations(true)
-        .build_vk_surface(&events_loop, instance.clone())
-        .expect("Could not create window");
+    let (device, mut queues, surface, mut events_loop) = init_vulkan().expect("Intialization error");
     let window = surface.window();
-
-    let queue_family = physical_device.queue_families().find(|&q| {
-        q.supports_graphics() && surface.is_supported(q).unwrap_or(false)
-    }).expect("Could not find queue.");
-    
-    let device_extensions = DeviceExtensions {
-        khr_swapchain: true,
-        .. DeviceExtensions::none()
-    };
-    let (device, mut queues) = Device::new(physical_device, physical_device.supported_features(),
-        &device_extensions, [(queue_family, 0.5)].iter().cloned()).expect("Could not create device");
 
     //TODO: Use multiple queues, and more efficiently.
     let queue = queues.next().expect("Could not retrieve queue from queues");
 
-    let (mut swapchain, images) = {
-        let capabilities = surface.capabilities(physical_device).unwrap();
-
-        let usage = capabilities.supported_usage_flags;
-
-        let alpha = capabilities.supported_composite_alpha.iter().next().unwrap();
-        
-        //TODO: Choose format based on our needs.
-        let format = capabilities.supported_formats[0].0;
-        
-        //TODO: Use more layers if necessary.
-        let layers = 1;
-
-        //NOTE: We could set this to capabilities.current_extent.unwrap_or(DEFAULT..)
-        //But since either way we want the initial dimensions to be the window dimensions
-        //we just get the physical dimensions this way
-        let dimensions = if let Some(dimensions) = window.get_inner_size() {
-            let dims: (u32, u32) = dimensions.to_physical(window.get_hidpi_factor()).into();
-            [dims.0, dims.1]
-        } else {
-            return;
-        };
-
-        let transform = capabilities.current_transform;
-
-        //Attempt to use triple buffering
-        let buffer_count = if let Some(limit) = capabilities.max_image_count {
-            min(3, limit)
-        } else { 
-            max(3, capabilities.min_image_count) 
-        };
-
-        let clip = true; //Clip parts of the buffer which aren't visible
-
-        let present_mode = PresentMode::Fifo;
-
-        Swapchain::new(device.clone(), surface.clone(), buffer_count, format, dimensions,
-            layers, usage, &queue, transform, alpha, present_mode, clip, None)
-            .expect("Could not create Swapchain")
-    };
+    let (mut swapchain, images) = gen_swapchain(surface.clone(), queue.clone(), device.clone())
+        .expect("Could not create swapchain");
 
     let vertex_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), [
         Vertex { position: [-0.5, -0.25] },
@@ -110,7 +46,7 @@ fn main() {
         Vertex { position: [0.25, -0.1] },
     ].iter().cloned()).expect("Could not create vertex buffer");
 
-    //Ring buffer than contains sub-buffers which are freed upon being dropped (cleanup_finished())
+    //Ring buffer that contains sub-buffers which are freed upon being dropped (cleanup_finished())
     let fragment_color_buffer = CpuBufferPool::<frag::ty::ColorData>::new(device.clone(), BufferUsage::all());
 
     let vs = vertex::Shader::load(device.clone()).expect("Could not load vertex shader");
@@ -229,6 +165,85 @@ fn main() {
 
 }
 
+//TODO: Error handling
+fn init_vulkan() -> Result<(Arc<Device>, QueuesIter, Arc<Surface<Window>>, EventsLoop), Box<Error>> {
+        
+    let instance = {
+        let extensions = vulkano_win::required_extensions();
+        let info = app_info_from_cargo_toml!();
+        Instance::new(Some(&info), &extensions, None).expect("Could not create instance")
+    };
+
+    //TODO: Filter devices by
+    //  1.) Optional features needed by my application
+    //  2.) Devices that can draw to my surface
+    //  3.) Let user choose between the rest (or just choose first one after that)
+    let physical_device = PhysicalDevice::enumerate(&instance).next().expect("No devices");
+
+    let events_loop = EventsLoop::new();
+    let surface = WindowBuilder::new()
+        .with_title("Riley's Vulkan Render Engine")
+        .with_decorations(true)
+        .build_vk_surface(&events_loop, instance.clone())
+        .expect("Could not create window");
+
+    let queue_family = physical_device.queue_families().find(|&q| {
+        q.supports_graphics() && surface.is_supported(q).unwrap_or(false)
+    }).expect("Could not find queue.");
+    
+    let device_extensions = DeviceExtensions {
+        khr_swapchain: true,
+        .. DeviceExtensions::none()
+    };
+    let (device, queues) = Device::new(physical_device, physical_device.supported_features(),
+        &device_extensions, [(queue_family, 0.5)].iter().cloned()).expect("Could not create device");
+
+    Ok((device, queues, surface, events_loop))
+} 
+
+fn gen_swapchain(surface: Arc<Surface<Window>>, queue: Arc<Queue>, device: Arc<Device>) 
+    -> Result<(Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>), SwapchainCreationError> {
+        
+        let window = surface.window();
+
+        let capabilities = surface.capabilities(device.physical_device()).unwrap();
+
+        let usage = capabilities.supported_usage_flags;
+
+        let alpha = capabilities.supported_composite_alpha.iter().next().unwrap();
+        
+        //TODO: Choose format based on our needs.
+        let format = capabilities.supported_formats[0].0;
+        
+        //TODO: Use more layers if necessary.
+        let layers = 1;
+
+        //NOTE: We could set this to capabilities.current_extent.unwrap_or(DEFAULT..)
+        //But since either way we want the initial dimensions to be the window dimensions
+        //we just get the physical dimensions this way
+        let dimensions = if let Some(dimensions) = window.get_inner_size() {
+            let dims: (u32, u32) = dimensions.to_physical(window.get_hidpi_factor()).into();
+            [dims.0, dims.1]
+        } else {
+            return Err(SwapchainCreationError::SurfaceLost);
+        };
+
+        let transform = capabilities.current_transform;
+
+        //Attempt to use triple buffering
+        let buffer_count = if let Some(limit) = capabilities.max_image_count {
+            min(3, limit)
+        } else { 
+            max(3, capabilities.min_image_count) 
+        };
+
+        let clip = true; //Clip parts of the buffer which aren't visible
+
+        let present_mode = PresentMode::Fifo;
+
+        Swapchain::new(device.clone(), surface.clone(), buffer_count, format, dimensions,
+            layers, usage, &queue, transform, alpha, present_mode, clip, None)
+}
 
 fn gen_framebuffers_from_window_size(
     images: &[Arc<SwapchainImage<Window>>],
