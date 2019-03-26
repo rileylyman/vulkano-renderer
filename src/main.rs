@@ -19,19 +19,39 @@ use vulkano_win::VkSurfaceBuild;
 use vulkano::device::{Device, DeviceExtensions, Queue, QueuesIter};
 use vulkano::swapchain::{AcquireError, Surface, Swapchain, SwapchainCreationError, PresentMode};
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
-use vulkano::image::swapchain::SwapchainImage;
+use vulkano::image::{AttachmentImage, swapchain::SwapchainImage};
 use vulkano::buffer::{CpuBufferPool, BufferUsage, CpuAccessibleBuffer};
-use vulkano::pipeline::{viewport::Viewport, GraphicsPipeline};
+use vulkano::pipeline::{viewport::Viewport, vertex::TwoBuffersDefinition, GraphicsPipeline};
 use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass};
 use vulkano::format::{Format, ClearValue};
 use vulkano::command_buffer::{CommandBufferExecFuture, AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
 use vulkano::sync;
 use vulkano::sync::{NowFuture, FlushError, GpuFuture};
 
+mod objload;
+
 #[derive(Clone, Debug)]
-struct Vertex {
-    position: [f32;2]
+pub struct Vertex {
+    position: (f32, f32, f32),
 } vulkano::impl_vertex!(Vertex, position);
+
+#[derive(Clone, Debug)]
+pub struct Normal {
+    normal: (f32, f32, f32),
+} vulkano::impl_vertex!(Normal, normal);
+
+#[derive(Clone, Debug)]
+pub struct TexVert {
+    position2D: (f32, f32),
+} vulkano::impl_vertex!(TexVert, position2D); 
+
+pub type IndexType = u16;
+#[derive(Clone, Debug)]
+pub struct Indices {
+    v: Vec<IndexType>,
+    vn: Vec<IndexType>,
+    vt: Vec<IndexType>,
+}  
 
 fn main() {
 
@@ -44,17 +64,24 @@ fn main() {
     let (mut swapchain, images) = gen_swapchain(surface.clone(), queue.clone(), device.clone())
         .expect("Could not create swapchain");
 
-    let vertex_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), [
-        Vertex { position: [-0.5, -0.25] },
-        Vertex { position: [0.0, 0.5] },
-        Vertex { position: [0.25, -0.1] },
-    ].iter().cloned()).expect("Could not create vertex buffer");
+    let (vertices, tex_verts, normals, indices) = objload::load_model(include_str!("res/chalet.obj"))
+        .expect("Could not load model");
+
+    let vertex_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), 
+        vertices.iter().cloned()).expect("Could not create vertex buffer");
+    let normals_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), 
+        normals.iter().cloned()).expect("Could not create vertex buffer");
+    let v_index_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+        indices.v.iter().cloned()).expect("Could not create v_index buffer");
+    let vn_index_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+        indices.vn.iter().cloned()).expect("Could not create vt_index buffer");
 
     //Ring buffer that contains sub-buffers which are freed upon being dropped (cleanup_finished())
-    let fragment_color_buffer = CpuBufferPool::<frag::ty::ColorData>::new(device.clone(), BufferUsage::all());
+    //let fragment_color_buffer = CpuBufferPool::<frag::ty::ColorData>::new(device.clone(), BufferUsage::all());
 
     let vs = vertex::Shader::load(device.clone()).expect("Could not load vertex shader");
     let fs =   frag::Shader::load(device.clone()).expect("Could not load fragment shader");
+
 
     let render_pass = Arc::new(vulkano::single_pass_renderpass!(
         device.clone(),
@@ -64,42 +91,47 @@ fn main() {
                 store: Store,
                 format: swapchain.format(),
                 samples: 1,
-            }
+            },
+            depth: {
+               load: Clear,
+               store: DontCare,
+               format: Format::D16Unorm,
+               samples: 1,
+            } 
         },
         pass: {
             color: [color],
-            depth_stencil: {}
+            depth_stencil: {depth}
         }
     ).expect("Could not create renderpass"));
     
     let pipeline = Arc::new(GraphicsPipeline::start()
-        .vertex_input_single_buffer::<Vertex>()
+        .vertex_input(TwoBuffersDefinition::<Vertex, Normal>::new())
         .vertex_shader(vs.main_entry_point(), ())
         .triangle_list()
         .viewports_dynamic_scissors_irrelevant(1)
         .fragment_shader(fs.main_entry_point(), ())
+        .depth_stencil_simple_depth()
         .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
         .build(device.clone())
         .expect("Could not create GraphicsPipeline"));
 
-    let (texture, texture_future) = load_texture(queue.clone(), include_bytes!("res/texture.png"))
-        .expect("Error loading texture");
-    let sampler = Sampler::new(device.clone(), Filter::Linear, Filter::Linear,
-        MipmapMode::Nearest, SamplerAddressMode::Repeat, SamplerAddressMode::Repeat,
-        SamplerAddressMode::Repeat, 0.0, 1.0, 0.0, 0.0).expect("Could not create sampler");
-    let texture_set = Arc::new(PersistentDescriptorSet::start(pipeline.clone(), 1)
-        .add_sampled_image(texture.clone(), sampler.clone())
-        .expect("Could not add sampled image")
-        .build().unwrap());
-    
+    //let (texture, texture_future) = load_texture(queue.clone(), include_bytes!("res/texture.png"))
+    //    .expect("Error loading texture");
+    //let sampler = Sampler::new(device.clone(), Filter::Linear, Filter::Linear,
+    //    MipmapMode::Nearest, SamplerAddressMode::Repeat, SamplerAddressMode::Repeat,
+    //    SamplerAddressMode::Repeat, 0.0, 1.0, 0.0, 0.0).expect("Could not create sampler");
+    //let texture_set = Arc::new(PersistentDescriptorSet::start(pipeline.clone(), 1)
+    //    .add_sampled_image(texture.clone(), sampler.clone())
+    //    .expect("Could not add sampled image")
+    //    .build().unwrap());
+   
+
     let mut dynamic_state = DynamicState { line_width: None, viewports: None, scissors: None };
-
-    let mut framebuffers = gen_framebuffers_from_window_size(&images, render_pass.clone(), &mut dynamic_state);
-
+    let mut framebuffers = gen_framebuffers_from_window_size(&images, render_pass.clone(), &mut dynamic_state, device.clone());
     let mut recreate_swapchain = false;
-
-    let mut previous_frame_end = Box::new(texture_future) as Box<GpuFuture>;
-
+    //let mut previous_frame_end = Box::new(texture_future) as Box<GpuFuture>;
+    let mut previous_frame_end = Box::new(sync::now(device.clone())) as Box<GpuFuture>;
     let mut done = false;
 
     let start = Instant::now();
@@ -116,7 +148,8 @@ fn main() {
             }; 
 
             swapchain = new_swapchain;
-            framebuffers = gen_framebuffers_from_window_size(&new_images, render_pass.clone(), &mut dynamic_state);
+            framebuffers = gen_framebuffers_from_window_size(&new_images, 
+                render_pass.clone(), &mut dynamic_state, device.clone());
             recreate_swapchain = false;
         } 
 
@@ -129,24 +162,26 @@ fn main() {
             Err(err) => panic!("{:?}", err)
         }; 
 
-        let clear_values: Vec<ClearValue> = vec!([0.0, 0.3, 0.6, 1.0].into());
+        let clear_values = [0.0, 0.3, 0.6, 1.0];
 
-        let fragment_color_subbuffer = {
-            let elapsed = (start.elapsed().as_millis() % 1000) as f32 / 1000.0;           
-            let data = frag::ty::ColorData {
-                color_data: [elapsed, 0.5, 0.5].into()
-            };  
-            fragment_color_buffer.next(data).expect("Could not generate next triangle color")
-        }; 
+        //let fragment_color_subbuffer = {
+        //    let elapsed = (start.elapsed().as_millis() % 1000) as f32 / 1000.0;           
+        //    let data = frag::ty::ColorData {
+        //        color_data: [elapsed, 0.5, 0.5].into()
+        //    };  
+        //    fragment_color_buffer.next(data).expect("Could not generate next triangle color")
+        //}; 
 
-        let set = Arc::new(PersistentDescriptorSet::start(pipeline.clone(), 0)
-            .add_buffer(fragment_color_subbuffer).expect("Could not add fragment subbuffer to descriptor set")
-            .build().unwrap());
+        //let set = Arc::new(PersistentDescriptorSet::start(pipeline.clone(), 0)
+        //    .add_buffer(fragment_color_subbuffer).expect("Could not add fragment subbuffer to descriptor set")
+        //    .build().unwrap());
 
         let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
-            .begin_render_pass(framebuffers[image_num].clone(), false, clear_values).unwrap()
-            .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), 
-                  (set.clone(), texture_set.clone()), ()).unwrap()
+            .begin_render_pass(framebuffers[image_num].clone(), false,
+                vec!(clear_values.into(), 1f32.into())).unwrap()
+            .draw_indexed(pipeline.clone(), &dynamic_state, vec!(vertex_buffer.clone(), normals_buffer.clone()), 
+
+                  v_index_buffer.clone(), (), ()).unwrap()
             .end_render_pass().unwrap()
             .build().unwrap();
         
@@ -270,7 +305,8 @@ fn load_texture(queue: Arc<Queue>, bytes: &[u8]) ->
 fn gen_framebuffers_from_window_size(
     images: &[Arc<SwapchainImage<Window>>],
     render_pass: Arc<RenderPassAbstract + Send + Sync>,
-    dynamic_state: &mut DynamicState
+    dynamic_state: &mut DynamicState,
+    device: Arc<Device>
     ) -> Vec<Arc<FramebufferAbstract + Send + Sync>> {
 
     let dimensions = images[0].dimensions();
@@ -282,10 +318,14 @@ fn gen_framebuffers_from_window_size(
     };
     dynamic_state.viewports = Some(vec!(viewport));
 
+    let depth_buffer = AttachmentImage::transient(device.clone(), dimensions, Format::D16Unorm)
+        .expect("Failed to create depth buffer");
+
     images.iter().map(|image| {
         Arc::new(
             Framebuffer::start(render_pass.clone())
                 .add(image.clone()).unwrap()
+                .add(depth_buffer.clone()).unwrap()
                 .build().unwrap()
         ) as Arc<FramebufferAbstract + Send + Sync>    
     }).collect::<Vec<_>>()
