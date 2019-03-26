@@ -21,7 +21,7 @@ use vulkano::swapchain::{AcquireError, Surface, Swapchain, SwapchainCreationErro
 use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::image::{AttachmentImage, swapchain::SwapchainImage};
 use vulkano::buffer::{CpuBufferPool, BufferUsage, CpuAccessibleBuffer};
-use vulkano::pipeline::{viewport::Viewport, vertex::TwoBuffersDefinition, GraphicsPipeline};
+use vulkano::pipeline::{GraphicsPipelineAbstract, viewport::Viewport, vertex::TwoBuffersDefinition, GraphicsPipeline};
 use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass};
 use vulkano::format::{Format, ClearValue};
 use vulkano::command_buffer::{CommandBufferExecFuture, AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
@@ -127,8 +127,8 @@ fn main() {
     //    .build().unwrap());
    
 
-    let mut dynamic_state = DynamicState { line_width: None, viewports: None, scissors: None };
-    let mut framebuffers = gen_framebuffers_from_window_size(&images, render_pass.clone(), &mut dynamic_state, device.clone());
+    let (mut pipeline, mut framebuffers) = gen_framebuffers_from_window_size(
+        &images, render_pass.clone(), device.clone(), &vs, &fs);
     let mut recreate_swapchain = false;
     //let mut previous_frame_end = Box::new(texture_future) as Box<GpuFuture>;
     let mut previous_frame_end = Box::new(sync::now(device.clone())) as Box<GpuFuture>;
@@ -142,14 +142,18 @@ fn main() {
            
             let dimensions = get_window_dimensions(&window).expect("Could not get new window dimensions");
             let (new_swapchain, new_images) = match swapchain.recreate_with_dimension(dimensions) {
-               Ok(res) => res,
-               Err(SwapchainCreationError::UnsupportedDimensions) => continue,
-               Err(err) => panic!("{:?}", err)
+                Ok(res) => res,
+                Err(SwapchainCreationError::UnsupportedDimensions) => continue,
+                Err(err) => panic!("{:?}", err)
             }; 
 
             swapchain = new_swapchain;
-            framebuffers = gen_framebuffers_from_window_size(&new_images, 
-                render_pass.clone(), &mut dynamic_state, device.clone());
+            let (new_pipeline, new_framebuffers) = gen_framebuffers_from_window_size(&new_images, 
+                render_pass.clone(), device.clone(), &vs, &fs);
+            
+            pipeline = new_pipeline;
+            framebuffers = new_framebuffers;
+
             recreate_swapchain = false;
         } 
 
@@ -179,8 +183,7 @@ fn main() {
         let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
             .begin_render_pass(framebuffers[image_num].clone(), false,
                 vec!(clear_values.into(), 1f32.into())).unwrap()
-            .draw_indexed(pipeline.clone(), &dynamic_state, vec!(vertex_buffer.clone(), normals_buffer.clone()), 
-
+            .draw_indexed(pipeline.clone(), &DynamicState::none(), vec!(vertex_buffer.clone(), normals_buffer.clone()), 
                   v_index_buffer.clone(), (), ()).unwrap()
             .end_render_pass().unwrap()
             .build().unwrap();
@@ -305,9 +308,10 @@ fn load_texture(queue: Arc<Queue>, bytes: &[u8]) ->
 fn gen_framebuffers_from_window_size(
     images: &[Arc<SwapchainImage<Window>>],
     render_pass: Arc<RenderPassAbstract + Send + Sync>,
-    dynamic_state: &mut DynamicState,
-    device: Arc<Device>
-    ) -> Vec<Arc<FramebufferAbstract + Send + Sync>> {
+    device: Arc<Device>,
+    vs: &vertex::Shader,
+    fs: &frag::Shader,
+    ) -> (Arc<GraphicsPipelineAbstract + Send + Sync>, Vec<Arc<FramebufferAbstract + Send + Sync>>) {
 
     let dimensions = images[0].dimensions();
 
@@ -316,19 +320,32 @@ fn gen_framebuffers_from_window_size(
         dimensions: [dimensions[0] as f32, dimensions[1] as f32],
         depth_range: 0.0..1.0
     };
-    dynamic_state.viewports = Some(vec!(viewport));
 
     let depth_buffer = AttachmentImage::transient(device.clone(), dimensions, Format::D16Unorm)
         .expect("Failed to create depth buffer");
 
-    images.iter().map(|image| {
+    let framebuffers = images.iter().map(|image| {
         Arc::new(
             Framebuffer::start(render_pass.clone())
                 .add(image.clone()).unwrap()
                 .add(depth_buffer.clone()).unwrap()
                 .build().unwrap()
         ) as Arc<FramebufferAbstract + Send + Sync>    
-    }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+
+    let pipeline = Arc::new(GraphicsPipeline::start()
+        .vertex_input(TwoBuffersDefinition::<Vertex, Normal>::new())
+        .vertex_shader(vs.main_entry_point(), ())
+        .triangle_list()
+        .viewports_dynamic_scissors_irrelevant(1)
+        .viewports(std::iter::once(viewport))
+        .fragment_shader(fs.main_entry_point(), ())
+        .depth_stencil_simple_depth()
+        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+        .build(device.clone())
+        .expect("Could not generate graphics pipeline"));
+    
+    (pipeline, framebuffers)
 }
 
 fn get_window_dimensions(window: &Window) -> Result<[u32;2], SwapchainCreationError> {
