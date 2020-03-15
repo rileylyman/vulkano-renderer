@@ -29,6 +29,7 @@ use vulkano::sync;
 use vulkano::sync::{NowFuture, FlushError, GpuFuture};
 
 mod objload;
+mod teapot;
 
 #[derive(Clone, Debug)]
 pub struct Vertex {
@@ -64,17 +65,21 @@ fn main() {
     let (mut swapchain, images) = gen_swapchain(surface.clone(), queue.clone(), device.clone())
         .expect("Could not create swapchain");
 
-    let (vertices, tex_verts, normals, indices) = objload::load_model(include_str!("res/chalet.obj"))
-        .expect("Could not load model");
+    //let (vertices, tex_verts, normals, indices) = objload::load_model(include_str!("res/chalet.obj"))
+    //    .expect("Could not load model");
+
+    let vertices = teapot::VERTICES;
+    let normals = teapot::NORMALS;
+    let indices = teapot::INDICES;
 
     let vertex_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), 
         vertices.iter().cloned()).expect("Could not create vertex buffer");
     let normals_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), 
         normals.iter().cloned()).expect("Could not create vertex buffer");
     let v_index_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
-        indices.v.iter().cloned()).expect("Could not create v_index buffer");
-    let vn_index_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
-        indices.vn.iter().cloned()).expect("Could not create vt_index buffer");
+        indices.iter().cloned()).expect("Could not create v_index buffer");
+    //let vn_index_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+    //    indices.vn.iter().cloned()).expect("Could not create vt_index buffer");
 
     //Ring buffer that contains sub-buffers which are freed upon being dropped (cleanup_finished())
     //let fragment_color_buffer = CpuBufferPool::<frag::ty::ColorData>::new(device.clone(), BufferUsage::all());
@@ -105,17 +110,6 @@ fn main() {
         }
     ).expect("Could not create renderpass"));
     
-    let pipeline = Arc::new(GraphicsPipeline::start()
-        .vertex_input(TwoBuffersDefinition::<Vertex, Normal>::new())
-        .vertex_shader(vs.main_entry_point(), ())
-        .triangle_list()
-        .viewports_dynamic_scissors_irrelevant(1)
-        .fragment_shader(fs.main_entry_point(), ())
-        .depth_stencil_simple_depth()
-        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
-        .build(device.clone())
-        .expect("Could not create GraphicsPipeline"));
-
     //let (texture, texture_future) = load_texture(queue.clone(), include_bytes!("res/texture.png"))
     //    .expect("Error loading texture");
     //let sampler = Sampler::new(device.clone(), Filter::Linear, Filter::Linear,
@@ -133,8 +127,6 @@ fn main() {
     //let mut previous_frame_end = Box::new(texture_future) as Box<GpuFuture>;
     let mut previous_frame_end = Box::new(sync::now(device.clone())) as Box<GpuFuture>;
     let mut done = false;
-
-    let start = Instant::now();
 
     loop {
         previous_frame_end.cleanup_finished();
